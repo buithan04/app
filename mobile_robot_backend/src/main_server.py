@@ -1,19 +1,15 @@
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import random
 import threading
 import time
+import requests # Cần pip install requests
 
-# --- CẤU HÌNH APP ---
-app = FastAPI(
-    title="Robot Control Center (Professional)",
-    description="Backend điều khiển Robot Jetson Xavier",
-    version="2.0"
-)
+# --- CẤU HÌNH ---
+app = FastAPI(title="Robot Brain AI", version="3.0")
 
-# Cấu hình CORS (Cho phép mọi nguồn truy cập - Quan trọng khi dev)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,81 +18,125 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Cấu hình Ollama (AI Local trên Jetson)
+OLLAMA_API = "http://localhost:11434/api/chat"
+AI_MODEL = "qwen2.5:7b" # Model bạn đã tải vào NVMe
+
+# Tính cách Robot
+SYSTEM_PROMPT = """
+Bạn là Xavier, một trợ lý robot thông minh chạy trên nền tảng Nvidia Jetson.
+Tính cách: Thân thiện, hơi hài hước, ngắn gọn.
+Nhiệm vụ: Trả lời câu hỏi bằng Tiếng Việt (tối đa 2-3 câu).
+Lưu ý: Nếu người dùng hỏi về cảm xúc, hãy thể hiện rõ ràng.
+"""
+
 # --- DATA MODELS ---
 class NavigationTarget(BaseModel):
     location: str
-    coordinate_x: float = 0.0
-    coordinate_y: float = 0.0
 
-# --- TRẠNG THÁI ROBOT (GLOBAL STATE) ---
+class ChatInput(BaseModel):
+    text: str
+
+# --- TRẠNG THÁI ROBOT ---
 robot_state = {
-    "battery": 100.0,      # Pin bắt đầu 100%
-    "temp": 42.0,          # Nhiệt độ C
-    "wifi_strength": "Strong",
-    "mode": "IDLE",        # IDLE, NAVIGATING, ERROR
-    "current_emotion": "normal"
+    "battery": 100.0,
+    "temp": 42.0,
+    "mode": "IDLE",
+    "current_emotion": "normal",
+    "last_response": ""
 }
 
-# --- THREAD MÔ PHỎNG (Background Simulation) ---
+# --- AI & EMOTION LOGIC ---
+def analyze_emotion(text):
+    """Phân tích cảm xúc dựa trên từ khóa trong câu trả lời"""
+    text = text.lower()
+    if any(x in text for x in ["haha", "vui", "tuyệt", "cười", "hay"]):
+        return "happy"
+    if any(x in text for x in ["buồn", "xin lỗi", "tiếc", "khóc", "khổ"]):
+        return "sad"
+    if any(x in text for x in ["yêu", "thương", "quý", "tim", "love"]):
+        return "love"
+    if any(x in text for x in ["wow", "bất ngờ", "thật sao", "!", "???"]):
+        return "surprised"
+    if any(x in text for x in ["ngủ", "mệt", "tạm biệt", "bye"]):
+        return "sleeping"
+    if any(x in text for x in ["giận", "bực", "cút"]):
+        return "angry"
+    return "normal"
+
+def query_ollama(text):
+    """Gửi tin nhắn sang Ollama"""
+    payload = {
+        "model": AI_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text}
+        ],
+        "stream": False
+    }
+    try:
+        # Timeout 30s để tránh treo server nếu AI tính quá lâu
+        response = requests.post(OLLAMA_API, json=payload, timeout=30)
+        if response.status_code == 200:
+            return response.json()["message"]["content"]
+        return "Hệ thống AI đang bận (Ollama Error)."
+    except Exception as e:
+        print(f"Lỗi AI: {e}")
+        return "Không kết nối được với não bộ AI (Check Ollama)."
+
+# --- THREAD GIẢ LẬP ---
 def simulation_loop():
-    """Mô phỏng pin tụt và nhiệt độ thay đổi theo thời gian"""
     while True:
-        # 1. Mô phỏng Pin tụt (0.5% mỗi giây)
+        # Giả lập pin tụt
         if robot_state["battery"] > 0:
-            robot_state["battery"] -= 0.1
-            robot_state["battery"] = round(robot_state["battery"], 1)
+            robot_state["battery"] = round(robot_state["battery"] - 0.05, 1)
         
-        # 2. Mô phỏng Nhiệt độ dao động (40 - 65 độ C)
-        change = random.uniform(-1.0, 1.0)
-        new_temp = robot_state["temp"] + change
-        robot_state["temp"] = round(max(40.0, min(65.0, new_temp)), 1)
-        
+        # Giả lập nhiệt độ
+        change = random.uniform(-0.5, 0.5)
+        robot_state["temp"] = round(max(38.0, min(65.0, robot_state["temp"] + change)), 1)
         time.sleep(1)
 
-# Chạy luồng mô phỏng ngay khi server khởi động
-sim_thread = threading.Thread(target=simulation_loop, daemon=True)
-sim_thread.start()
+threading.Thread(target=simulation_loop, daemon=True).start()
 
 # --- API ENDPOINTS ---
 
-@app.get("/")
-def read_root():
-    return {"status": "Running", "system": "Jetson Xavier NX"}
-
 @app.get("/status")
-def get_robot_status():
-    """API trả về toàn bộ trạng thái robot (được gọi liên tục bởi GUI)"""
+def get_status():
     return robot_state
 
-@app.post("/set_emotion/{emotion}")
-def set_emotion(emotion: str):
-    """API nhận lệnh đổi biểu cảm từ GUI"""
-    valid_emotions = ["normal", "happy", "sad", "angry", "thinking", "sleeping", "love", "surprised"]
+@app.post("/chat")
+def chat_with_robot(data: ChatInput):
+    print(f"[USER]: {data.text}")
     
-    if emotion not in valid_emotions:
-        # Nếu gửi biểu cảm lạ, vẫn chấp nhận nhưng log cảnh báo
-        print(f"[WARNING] Nhận biểu cảm lạ: {emotion}")
+    # 1. Đánh dấu đang suy nghĩ
+    robot_state["current_emotion"] = "thinking"
     
+    # 2. Gọi AI
+    ai_response = query_ollama(data.text)
+    
+    # 3. Phân tích cảm xúc
+    emotion = analyze_emotion(ai_response)
     robot_state["current_emotion"] = emotion
-    print(f"[GUI CMD] Đổi biểu cảm -> {emotion}")
-    return {"status": "success", "emotion": emotion}
+    robot_state["last_response"] = ai_response
+    
+    print(f"[BOT]: {ai_response} -> Emotion: {emotion}")
+    
+    return {
+        "response": ai_response,
+        "emotion": emotion
+    }
 
+# Giữ lại các API cũ để tương thích code cũ nếu cần
 @app.post("/navigate")
-def navigate_to(target: NavigationTarget):
-    """API nhận lệnh di chuyển"""
-    print(f"[NAV] Đang di chuyển tới: {target.location}")
+def navigate(target: NavigationTarget):
     robot_state["mode"] = "NAVIGATING"
     return {"status": "accepted", "target": target.location}
 
-@app.post("/stop")
-def emergency_stop(): 
-    print("!!! [EMERGENCY] DỪNG KHẨN CẤP ĐƯỢC KÍCH HOẠT !!!")
-    robot_state["mode"] = "STOPPED"
-    robot_state["current_emotion"] = "surprised" # Robot ngạc nhiên khi bị dừng
-    return {"status": "stopped"}
+@app.post("/set_emotion/{emotion}")
+def set_manual_emotion(emotion: str):
+    robot_state["current_emotion"] = emotion
+    return {"status": "ok"}
 
-# --- ENTRY POINT ---
 if __name__ == "__main__":
-    # Chạy server tại 0.0.0.0 để các máy khác trong mạng LAN có thể truy cập
-    print("🚀 Server Backend đang khởi động trên port 8000...")
+    print("🚀 Server AI đang khởi động trên port 8000...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
